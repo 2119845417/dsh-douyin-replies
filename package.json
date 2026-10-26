@@ -1,0 +1,18 @@
+{
+  "name": "dsh-douyin-replies",
+  "version": "0.1.0",
+  "description": "Multi-video, top-level Douyin comment reply workflow for DeepSeek Harness.",
+  "type": "module",
+  "main": "./src/index.js",
+  "files": ["src/", "skills/", "cordis.patch.yml", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "check": "node --check src/index.js && node --check src/browser.js && node --check src/service.js && node --check src/store.js",
+    "cli": "node src/cli.js"
+  },
+  "dependencies": { "playwright-core": "1.64.1" },
+  "peerDependencies": { "@deepseek-ai/dsh-tools": ">=0.2.1-rc.3 <0.3.0" },
+  "engines": { "node": ">=24.9.0", "dsh": ">=0.2.1-rc.3 <0.3.0" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "license": "MIT"
+}

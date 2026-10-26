@@ -1,0 +1,9 @@
+node_modules/
+browser-profile/
+state.json
+process.lock
+browser-latest.png
+*.tgz
+*.log
+.env
+.env.*
