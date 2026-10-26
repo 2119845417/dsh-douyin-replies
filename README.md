@@ -1,4 +1,4 @@
-# 抖音多视频顶层评论回复插件
+# 抖音多视频顶层评论回复插件 0.2.0
 
 DeepSeek Harness Bundle，配套 `skills/douyin-replies/SKILL.md`。AI 读取多个本人视频的顶层评论，生成回复并调用工具发送。浏览器采用 Playwright 驱动已安装 Chrome / Edge，借鉴 ego-browser 的观察、操作、验证工作流，不依赖或捆绑 ego-browser。
 
@@ -40,10 +40,44 @@ CLI 未放进 PATH 时，用你的 Harness 启动器替换 `dsh`，源码环境�
 2. 调用 `douyin_open_browser`，你在独立 Chrome 窗口内扫码登录。不会直接读取日常浏览器的登录目录。
 3. AI 用 `douyin_inspect_page` 和截图检查实际页面，调用 `douyin_calibrate` 保存 CSS 选择器。字段完整说明由 `douyin_instructions` 提供；工具支持评论面板展开和“展开回复”按钮的可选选择器。
 4. `douyin_scan_comments` 逐个扫描视频。默认只读已加载可见部分；对指定视频传 `scroll: true` 可继续滚动发现评论。
-5. AI 用 `douyin_draft_reply` 保存草稿。`ready: false` 不发送；在用户授权的自动回复任务中可设为 `true`。
+5. AI 先用 `douyin_reply_context` 读取保存的人格和不回复规则，再用 `douyin_draft_reply` 保存草稿并传回当前 `revision`。`ready: false` 不发送；在用户授权的自动回复任务中可设为 `true`。
 6. `douyin_send_ready` 逐条发送并核实结果。默认每批最多 10 条、发送尝试间隔至少 15 秒，均可在 setup 中配置。这是操作节奏限制，不是规避平台限制的机制。
 
 **只有目标用户是顶层评论作者时才操作“回复”。** 发出的回复出现在那条评论下面是正常结果；插件不会选择楼中楼的其他用户回复作为目标。
+
+## 回复人格与不回复规则
+
+设置会持久保存到当前账号的 `state.json`，重启后继续使用。当前通过 AI 工具或 JSON 文件配置，没有独立的图形设置页。
+
+可以直接对 Harness 中的 AI 说：
+
+> 把回复人格设为“亲切、自然、有一点幽默的视频作者”，尽量一句话、最多 80 字，不用客服套话。含“互关”“加微信”的留言不回复，广告引流和人身攻击也不回复，回复里不要出现“保证有效”。请调用 douyin_set_reply_preferences 保存。
+
+工具支持按字段更新，数组会整体替换。完整可修改示例见 `examples/reply-preferences.json`。这份示例不会自动生效，需明确保存；在插件未运行时，也可用命令导入：
+
+```powershell
+node src/cli.js preferences .\examples\reply-preferences.json
+node src/cli.js preferences
+```
+
+| 设置字段 | 含义与执行方式 |
+| --- | --- |
+| persona.name / role | 人格名称与角色身份 |
+| persona.tone / language | 语气与语言，作为模型生成要求 |
+| persona.instructions / examples | 补充要求、示例回复，供模型参考，不逐字套用 |
+| persona.maxLength | 回复长度上限，与任务 maxReplyLength 取较小值，代码检查 |
+| filters.keywords | 评论正文包含任一词就跳过，忽略英文大小写 |
+| filters.authors | 不回复的用户名或完整主页链接；重名场景建议用主页链接 |
+| filters.categories | 广告、人身攻击等语义类别，由 AI 判断并调用跳过工具 |
+| filters.forbiddenReplyKeywords | 禁止出现在生成回复中的措辞，代码拒绝保存或发送 |
+| filters.skipLinks | 跳过包含 http(s) 或 www 链接的评论 |
+| filters.skipEmojiOnly | 可选跳过只有 Unicode 文字表情的评论，不涉及收藏表情包 |
+
+明确的关键词、作者、链接与长度限制由插件执行；人格语气和语义类别依赖调用模型理解，不是额外部署的分类模型，也不承诺完全消除误判。默认不额外屏蔽关键词、作者或类别。
+
+修改人格或规则时，已有 `ready` 回复降为 `draft`，需要按新要求检查或重写。更新后的设置版本通过 `douyin_reply_context` 的 `revision` 返回，保存草稿时必须带回；旧版本不能直接发送。新规则命中的待处理评论立即跳过；移除该过滤规则后，自动过滤的评论恢复 `new`，不会恢复成 `ready`。人工明确跳过、已发送、待核实的记录均不自动重置。
+
+**收藏表情回复按用户要求暂缓，本版本没有图片/GIF 导入、收藏表情选择或媒体发送功能。** 普通 Unicode 字符仍可随文字回复，收藏表情需以后在真实抖音页面上单独适配。
 
 ## 能力与工具
 
@@ -51,6 +85,8 @@ CLI 未放进 PATH 时，用你的 Harness 启动器替换 `dsh`，源码环境�
 | --- | --- |
 | douyin_instructions | 读取配套 Skill |
 | douyin_setup | 本人账号、多视频列表、浏览器和批次参数 |
+| douyin_set_reply_preferences | 保存/局部更新回复人格与不回复规则 |
+| douyin_reply_context | 读取人格、过滤规则、示例、当前设置版本和可选评论上下文 |
 | douyin_open_browser | 打开独立浏览器 / 切换目标视频 |
 | douyin_inspect_page / douyin_screenshot | 只读检查页面与截图 |
 | douyin_calibrate | 校准页面 CSS 适配器 |
@@ -97,7 +133,7 @@ node src/cli.js browser
 node src/cli.js status
 ```
 
-浏览器测试在临时独立 Chrome 目录内拦截全部页面请求，使用本地模拟评论区，不连接抖音，也不发送真实评论。测试覆盖多视频、楼中楼排除、页面级回复框、账号/作者校验、重复留言歧义、发送不确定、断电状态恢复等。
+浏览器测试在临时独立 Chrome 目录内拦截全部页面请求，使用本地模拟评论区，不连接抖音，也不发送真实评论。26 项测试覆盖多视频、楼中楼排除、页面级回复框、账号/作者校验、重复留言歧义、发送不确定、断电恢复、人格保存、过滤规则与草稿版本校验等。
 
 **验证边界：** 本地真实 Chrome + Playwright 浏览器测试已执行；真实 Harness 宿主装配和真实抖音登录/页面/发送未执行。交付测试报告记录具体结果。不要把模拟页面测试通过解释为抖音线上操作已经验证。
 

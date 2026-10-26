@@ -2,6 +2,7 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import { normalized, profileUrl, validateAdapter, validateSettings, videoUrl } from './domain.js'
+import { exclusion, generationContext, preferences, updatePreferences, validateReply } from './preferences.js'
 
 export class Service {
   constructor(store, browser) { this.store = store; this.browser = browser; this.tail = Promise.resolve(); this.stopping = false }
@@ -58,6 +59,38 @@ export class Service {
   async inspect(selector) { return this.browser.inspect(selector) }
   async screenshot() { return this.browser.screenshot(join(this.store.directory, 'browser-latest.png')) }
 
+  async setPreferences(patch) {
+    const next = updatePreferences(this.store.data.preferences, patch)
+    if (JSON.stringify(next) === JSON.stringify(preferences(this.store.data.preferences))) return { ...this.replyContext(), affected: [], note: '设置未变化，保留已有队列。' }
+    this.store.data.preferences = next
+    this.store.data.preferenceRevision = (this.store.data.preferenceRevision ?? 0) + 1
+    const affected = []
+    for (const item of Object.values(this.store.data.comments)) {
+      const reason = exclusion(item, next)
+      if (reason && ['new', 'draft', 'ready'].includes(item.status)) {
+        item.status = 'skipped'; item.skipSource = 'filter'; item.reason = reason; affected.push(item.key)
+      } else if (!reason && item.status === 'skipped' && item.skipSource === 'filter') {
+        item.status = 'new'; item.reply = null; item.reason = null; delete item.skipSource; affected.push(item.key)
+      } else if (item.status === 'ready') {
+        item.status = 'draft'; item.reason = '人格或回复规则已修改，请按新设置检查草稿后重新设为 ready。'; affected.push(item.key)
+      }
+    }
+    await this.store.save()
+    return { ...this.replyContext(), affected, note: '已保存。人格语气与类别过滤交由模型判断；硬性过滤和长度限制由代码校验。已有 ready 草稿已降为 draft，不能沿用旧设置直接发送。' }
+  }
+
+  replyContext(key) {
+    const config = preferences(this.store.data.preferences)
+    const context = { ...generationContext(config), revision: this.store.data.preferenceRevision ?? 0 }
+    if (key) {
+      const item = this.store.data.comments[key]
+      if (!item) throw new Error('找不到评论，请先扫描。')
+      context.comment = { key: item.key, video: item.video, author: item.author, text: item.text, status: item.status }
+      context.excludedReason = exclusion(item, config)
+    }
+    return context
+  }
+
   async calibrate(input) {
     const adapter = validateAdapter(input)
     const video = videoUrl(this.browser.page?.url() ?? '')
@@ -90,7 +123,9 @@ export class Service {
             rows.push({ key: previous.key, author: previous.author, text: previous.text, status: previous.status })
             continue
           }
-          const item = { key: comment.key, video, domId: comment.domId, author: comment.author, authorUrl: comment.authorUrl, text: comment.text, status: ownComment || ownReply ? 'skipped' : 'new', reason: ownComment ? '账号自己的评论' : ownReply ? '页面已显示自己的回复' : null, discoveredAt: Date.now(), reply: null }
+          const filtered = exclusion(comment, this.store.data.preferences)
+          const item = { key: comment.key, video, domId: comment.domId, author: comment.author, authorUrl: comment.authorUrl, text: comment.text, status: ownComment || ownReply || filtered ? 'skipped' : 'new', reason: ownComment ? '账号自己的评论' : ownReply ? '页面已显示自己的回复' : filtered, discoveredAt: Date.now(), reply: null }
+          if (filtered && !ownComment && !ownReply) item.skipSource = 'filter'
           this.store.data.comments[item.key] = item
           rows.push({ key: item.key, author: item.author, text: item.text, status: item.status })
         }
@@ -101,19 +136,25 @@ export class Service {
     return { videos: results }
   }
 
-  async draft(key, reply, ready = false) {
+  async draft(key, reply, ready = false, revision) {
     const item = this.store.data.comments[key]
     if (!item) throw new Error('找不到评论，请先扫描。')
     this.allowedVideo(item.video)
     if (!['new', 'draft', 'ready'].includes(item.status)) throw new Error(`评论当前状态 ${item.status}，不能覆写草稿或重新发送。`)
-    const value = normalized(reply)
-    if (!value || [...value].length > this.settings().maxReplyLength) throw new Error('回复为空或超过 maxReplyLength。')
+    const currentRevision = this.store.data.preferenceRevision ?? 0
+    if (currentRevision > 0 && revision !== currentRevision) throw new Error('请先读取 douyin_reply_context，再使用返回的 revision 保存草稿；不能跳过已保存的人格规则。')
+    const filtered = exclusion(item, this.store.data.preferences)
+    if (filtered) throw new Error(filtered)
+    const config = preferences(this.store.data.preferences)
+    const value = validateReply(reply ?? '', config, this.settings())
     if (value === item.text) throw new Error('回复与原评论完全相同，请重新生成。')
     item.reply = value
+    item.preferenceRevision = currentRevision
     item.status = ready ? 'ready' : 'draft'
+    item.reason = null
     item.draftedAt = Date.now()
     await this.store.save()
-    return { key, status: item.status, reply: item.reply, video: item.video, author: item.author, text: item.text }
+    return { key, status: item.status, reply: item.reply, revision: currentRevision, video: item.video, author: item.author, text: item.text }
   }
 
   async send({ keys, limit } = {}, signal) {
@@ -134,9 +175,20 @@ export class Service {
       signal?.throwIfAborted()
       this.allowedVideo(item.video)
       if (item.status !== 'ready') { results.push({ key: item.key, status: item.status, skipped: true }); continue }
+      const filtered = exclusion(item, this.store.data.preferences)
+      if (filtered) {
+        item.status = 'skipped'; item.skipSource = 'filter'; item.reason = filtered; await this.store.save()
+        results.push({ key: item.key, status: item.status, reason: filtered }); continue
+      }
+      if ((item.preferenceRevision ?? 0) !== (this.store.data.preferenceRevision ?? 0)) {
+        item.status = 'draft'; item.reason = '设置版本已变化，草稿需重新生成或确认。'; await this.store.save()
+        results.push({ key: item.key, status: item.status, reason: item.reason }); continue
+      }
       const pause = Math.max(0, this.store.data.lastAttemptAt + settings.minIntervalMs - Date.now())
       if (pause) await delay(pause, undefined, { signal })
       try {
+        const config = preferences(this.store.data.preferences)
+        validateReply(item.reply ?? '', config, settings)
         const submit = await this.browser.prepare(settings, adapter, item, signal)
         signal?.throwIfAborted()
         item.status = 'sending'
@@ -185,7 +237,7 @@ export class Service {
   async skip(key, reason) {
     const item = this.store.data.comments[key]
     if (!item || !['new', 'draft', 'ready'].includes(item.status)) throw new Error('只能跳过尚未发送的评论。')
-    item.status = 'skipped'; item.reason = normalized(reason) || '按任务规则跳过'
+    item.status = 'skipped'; item.skipSource = 'manual'; item.reason = normalized(reason) || '按任务规则跳过'
     await this.store.save()
     return { key, status: item.status }
   }
@@ -194,7 +246,7 @@ export class Service {
     const counts = {}
     const comments = Object.values(this.store.data.comments)
     for (const item of comments) counts[item.status] = (counts[item.status] ?? 0) + 1
-    return { settings: this.store.data.settings, calibrated: !!this.store.data.adapter, counts, comments: comments.map(({ key, video, author, text, reply, status, reason }) => ({ key, video, author, text, reply, status, reason })) }
+    return { settings: this.store.data.settings, replyPreferences: preferences(this.store.data.preferences), preferenceRevision: this.store.data.preferenceRevision ?? 0, calibrated: !!this.store.data.adapter, counts, comments: comments.map(({ key, video, author, text, reply, status, reason }) => ({ key, video, author, text, reply, status, reason })) }
   }
 
   async close() { this.stopping = true; await this.browser.cancelPage(); await this.tail; await this.browser.close(); await this.store.close() }
